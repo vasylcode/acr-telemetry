@@ -5,10 +5,13 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -19,7 +22,8 @@ import (
 const (
 	physicsMapName = `Local\acpmf_physics`
 	physicsMapSize = 800
-	pollInterval   = 100 * time.Millisecond
+	pollInterval   = 5 * time.Millisecond
+	streamInterval = 16 * time.Millisecond
 )
 
 var procOpenFileMappingW = windows.NewLazySystemDLL("kernel32.dll").NewProc("OpenFileMappingW")
@@ -35,6 +39,18 @@ type physicsSample struct {
 	SpeedKMH float32
 }
 
+type dashState struct {
+	PacketID int32   `json:"packetId"`
+	SpeedKMH float32 `json:"speedKmh"`
+	RPM      int32   `json:"rpm"`
+	Gear     string  `json:"gear"`
+	Gas      float32 `json:"gas"`
+	Brake    float32 `json:"brake"`
+	Steer    float32 `json:"steer"`
+}
+
+var latestState atomic.Value
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "acr-telemetry: %v\n", err)
@@ -43,11 +59,14 @@ func main() {
 }
 
 func run() error {
+	addr := flag.String("addr", ":8765", "HTTP listen address")
+	flag.Parse()
+
 	ctxDone := make(chan os.Signal, 1)
 	signal.Notify(ctxDone, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(ctxDone)
 
-	fmt.Println("ACR telemetry shared-memory probe")
+	fmt.Println("ACR telemetry dashboard")
 	fmt.Println("Waiting for Assetto Corsa Rally physics map...")
 
 	reader, err := waitForSharedMemory(ctxDone)
@@ -55,6 +74,14 @@ func run() error {
 		return err
 	}
 	defer reader.Close()
+
+	server := &http.Server{Addr: *addr, Handler: routes()}
+	go func() {
+		fmt.Printf("Dashboard: http://localhost%s\n", *addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "web server: %v\n", err)
+		}
+	}()
 
 	fmt.Printf("Connected to %s (%d bytes). Press Ctrl+C to stop.\n\n", physicsMapName, physicsMapSize)
 
@@ -66,6 +93,7 @@ func run() error {
 		select {
 		case <-ctxDone:
 			fmt.Println("Stopping.")
+			_ = server.Close()
 			return nil
 		case <-ticker.C:
 			sample, err := reader.ReadPhysicsSample()
@@ -76,18 +104,92 @@ func run() error {
 				continue
 			}
 			lastPacketID = sample.PacketID
-			fmt.Printf("packet=%d speed=%.1f km/h rpm=%d gear=%s throttle=%.0f%% brake=%.0f%% fuel=%.1f L steer=%.2f\n",
-				sample.PacketID,
-				sample.SpeedKMH,
-				sample.RPM,
-				formatGear(sample.Gear),
-				sample.Gas*100,
-				sample.Brake*100,
-				sample.Fuel,
-				sample.Steer,
-			)
+			storeDashState(sample.toDashState())
 		}
 	}
+}
+
+func routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", dashboardHandler)
+	mux.HandleFunc("/events", eventsHandler)
+	mux.HandleFunc("/api/state", stateHandler)
+	return mux
+}
+
+func dashboardHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(dashboardHTML))
+}
+
+func eventsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	ticker := time.NewTicker(streamInterval)
+	defer ticker.Stop()
+
+	lastPacketID := int32(-1)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			state := loadDashState()
+			if state.PacketID == lastPacketID {
+				continue
+			}
+			lastPacketID = state.PacketID
+			fmt.Fprintf(w, "data: {\"packetId\":%d,\"speedKmh\":%.1f,\"rpm\":%d,\"gear\":%q,\"gas\":%.3f,\"brake\":%.3f,\"steer\":%.3f}\n\n",
+				state.PacketID, state.SpeedKMH, state.RPM, state.Gear, state.Gas, state.Brake, state.Steer)
+			flusher.Flush()
+		}
+	}
+}
+
+func stateHandler(w http.ResponseWriter, _ *http.Request) {
+	state := loadDashState()
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprintf(w, "{\"packetId\":%d,\"speedKmh\":%.1f,\"rpm\":%d,\"gear\":%q,\"gas\":%.3f,\"brake\":%.3f,\"steer\":%.3f}\n",
+		state.PacketID, state.SpeedKMH, state.RPM, state.Gear, state.Gas, state.Brake, state.Steer)
+}
+
+func (s physicsSample) toDashState() dashState {
+	return dashState{
+		PacketID: s.PacketID,
+		SpeedKMH: s.SpeedKMH,
+		RPM:      s.RPM,
+		Gear:     formatGear(s.Gear),
+		Gas:      s.Gas,
+		Brake:    s.Brake,
+		Steer:    s.Steer,
+	}
+}
+
+func storeDashState(state dashState) {
+	latestState.Store(state)
+}
+
+func loadDashState() dashState {
+	state, ok := latestState.Load().(dashState)
+	if !ok {
+		return dashState{Gear: "N"}
+	}
+	return state
 }
 
 func waitForSharedMemory(done <-chan os.Signal) (*sharedMemoryReader, error) {
@@ -166,7 +268,7 @@ func (r *sharedMemoryReader) ReadPhysicsSample() (physicsSample, error) {
 	if r == nil || r.addr == 0 {
 		return physicsSample{}, errors.New("shared memory is not open")
 	}
-	if r.size < 32 {
+	if r.size < 596 {
 		return physicsSample{}, fmt.Errorf("physics map too small: %d bytes", r.size)
 	}
 
@@ -182,6 +284,44 @@ func (r *sharedMemoryReader) ReadPhysicsSample() (physicsSample, error) {
 		SpeedKMH: math.Float32frombits(binary.LittleEndian.Uint32(data[28:32])),
 	}, nil
 }
+
+const dashboardHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ACR Telemetry Debug</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d10;--panel:#14181d;--line:#2a3037;--text:#e8edf2;--muted:#8d98a5;--live:#29ff6a;--stale:#ffb020}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;padding:24px}.wrap{max-width:760px;margin:0 auto}h1{font-size:22px;margin:0 0 8px}.meta{color:var(--muted);margin-bottom:20px}.status{display:inline-flex;gap:8px;align-items:center}.dot{width:10px;height:10px;border-radius:50%;background:var(--stale)}.dot.live{background:var(--live);box-shadow:0 0 12px var(--live)}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left}th{width:42%;color:var(--muted);font-weight:600}td{font-variant-numeric:tabular-nums}pre{white-space:pre-wrap;background:#07090b;border:1px solid var(--line);padding:12px;overflow:auto}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <h1>ACR Telemetry Debug</h1>
+  <div class="meta"><span class="status"><span class="dot" id="dot"></span><span id="status">connecting</span></span></div>
+  <table><tbody id="rows"></tbody></table>
+  <h2>Raw JSON</h2>
+  <pre id="raw">{}</pre>
+</main>
+<script>
+const els={rows:document.getElementById('rows'),raw:document.getElementById('raw'),dot:document.getElementById('dot'),status:document.getElementById('status')};
+let state={speedKmh:0,rpm:0,gear:'N',gas:0,brake:0,steer:0},lastSeen=0;
+const fields=[['packetId','Packet ID'],['speedKmh','Speed km/h'],['rpm','RPM'],['gear','Gear'],['gas','Throttle'],['brake','Brake'],['steer','Steer']];
+els.rows.innerHTML=fields.map(([key,label])=>'<tr><th>'+label+'</th><td id="f_'+key+'">-</td></tr>').join('');
+function render(){
+  for(const [key] of fields){const el=document.getElementById('f_'+key);let value=state[key];if(typeof value==='number')value=Number.isInteger(value)?value:value.toFixed(3);el.textContent=value ?? '-'}
+  els.raw.textContent=JSON.stringify(state,null,2);
+  const live=Date.now()-lastSeen<750; els.dot.classList.toggle('live',live); els.status.textContent=live?'live':'waiting';
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+const es=new EventSource('/events');
+es.onmessage=e=>{state=JSON.parse(e.data);lastSeen=Date.now()};
+es.onerror=()=>{els.status.textContent='reconnecting'};
+</script>
+</body>
+</html>`
 
 func (r *sharedMemoryReader) Close() error {
 	if r == nil {
