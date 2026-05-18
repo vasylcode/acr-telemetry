@@ -29,24 +29,27 @@ const (
 var procOpenFileMappingW = windows.NewLazySystemDLL("kernel32.dll").NewProc("OpenFileMappingW")
 
 type physicsSample struct {
-	PacketID int32
-	Gas      float32
-	Brake    float32
-	Fuel     float32
-	Gear     int32
-	RPM      int32
-	Steer    float32
-	SpeedKMH float32
+	PacketID      int32
+	Gas           float32
+	Brake         float32
+	Fuel          float32
+	Gear          int32
+	RPM           int32
+	CurrentMaxRPM int32
+	Steer         float32
+	SpeedKMH      float32
 }
 
 type dashState struct {
-	PacketID int32   `json:"packetId"`
-	SpeedKMH float32 `json:"speedKmh"`
-	RPM      int32   `json:"rpm"`
-	Gear     string  `json:"gear"`
-	Gas      float32 `json:"gas"`
-	Brake    float32 `json:"brake"`
-	Steer    float32 `json:"steer"`
+	PacketID             int32   `json:"packetId"`
+	SpeedKMH             float32 `json:"speedKmh"`
+	PhysicsRPM           int32   `json:"physicsRpm"`
+	PhysicsCurrentMaxRPM int32   `json:"physicsCurrentMaxRpm"`
+	RPMRatio             float32 `json:"rpmRatio"`
+	Gear                 string  `json:"gear"`
+	Gas                  float32 `json:"gas"`
+	Brake                float32 `json:"brake"`
+	Steer                float32 `json:"steer"`
 }
 
 var latestState atomic.Value
@@ -153,8 +156,7 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			lastPacketID = state.PacketID
-			fmt.Fprintf(w, "data: {\"packetId\":%d,\"speedKmh\":%.1f,\"rpm\":%d,\"gear\":%q,\"gas\":%.3f,\"brake\":%.3f,\"steer\":%.3f}\n\n",
-				state.PacketID, state.SpeedKMH, state.RPM, state.Gear, state.Gas, state.Brake, state.Steer)
+			writeDashStateJSON(w, "data: ", state, "\n\n")
 			flusher.Flush()
 		}
 	}
@@ -164,19 +166,29 @@ func stateHandler(w http.ResponseWriter, _ *http.Request) {
 	state := loadDashState()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprintf(w, "{\"packetId\":%d,\"speedKmh\":%.1f,\"rpm\":%d,\"gear\":%q,\"gas\":%.3f,\"brake\":%.3f,\"steer\":%.3f}\n",
-		state.PacketID, state.SpeedKMH, state.RPM, state.Gear, state.Gas, state.Brake, state.Steer)
+	writeDashStateJSON(w, "", state, "\n")
+}
+
+func writeDashStateJSON(w http.ResponseWriter, prefix string, state dashState, suffix string) {
+	fmt.Fprintf(w, "%s{\"packetId\":%d,\"speedKmh\":%.1f,\"physics\":{\"rpm\":%d,\"currentMaxRpm\":%d},\"rpmRatio\":%.4f,\"gear\":%q,\"gas\":%.3f,\"brake\":%.3f,\"steer\":%.3f}%s",
+		prefix, state.PacketID, state.SpeedKMH, state.PhysicsRPM, state.PhysicsCurrentMaxRPM, state.RPMRatio, state.Gear, state.Gas, state.Brake, state.Steer, suffix)
 }
 
 func (s physicsSample) toDashState() dashState {
+	rpmRatio := float32(0)
+	if s.CurrentMaxRPM > 0 {
+		rpmRatio = float32(s.RPM) / float32(s.CurrentMaxRPM)
+	}
 	return dashState{
-		PacketID: s.PacketID,
-		SpeedKMH: s.SpeedKMH,
-		RPM:      s.RPM,
-		Gear:     formatGear(s.Gear),
-		Gas:      s.Gas,
-		Brake:    s.Brake,
-		Steer:    s.Steer,
+		PacketID:             s.PacketID,
+		SpeedKMH:             s.SpeedKMH,
+		PhysicsRPM:           s.RPM,
+		PhysicsCurrentMaxRPM: s.CurrentMaxRPM,
+		RPMRatio:             rpmRatio,
+		Gear:                 formatGear(s.Gear),
+		Gas:                  s.Gas,
+		Brake:                s.Brake,
+		Steer:                s.Steer,
 	}
 }
 
@@ -274,14 +286,15 @@ func (r *sharedMemoryReader) ReadPhysicsSample() (physicsSample, error) {
 
 	data := unsafe.Slice((*byte)(unsafe.Pointer(r.addr)), r.size)
 	return physicsSample{
-		PacketID: int32(binary.LittleEndian.Uint32(data[0:4])),
-		Gas:      math.Float32frombits(binary.LittleEndian.Uint32(data[4:8])),
-		Brake:    math.Float32frombits(binary.LittleEndian.Uint32(data[8:12])),
-		Fuel:     math.Float32frombits(binary.LittleEndian.Uint32(data[12:16])),
-		Gear:     int32(binary.LittleEndian.Uint32(data[16:20])),
-		RPM:      int32(binary.LittleEndian.Uint32(data[20:24])),
-		Steer:    math.Float32frombits(binary.LittleEndian.Uint32(data[24:28])),
-		SpeedKMH: math.Float32frombits(binary.LittleEndian.Uint32(data[28:32])),
+		PacketID:      int32(binary.LittleEndian.Uint32(data[0:4])),
+		Gas:           math.Float32frombits(binary.LittleEndian.Uint32(data[4:8])),
+		Brake:         math.Float32frombits(binary.LittleEndian.Uint32(data[8:12])),
+		Fuel:          math.Float32frombits(binary.LittleEndian.Uint32(data[12:16])),
+		Gear:          int32(binary.LittleEndian.Uint32(data[16:20])),
+		RPM:           int32(binary.LittleEndian.Uint32(data[20:24])),
+		Steer:         math.Float32frombits(binary.LittleEndian.Uint32(data[24:28])),
+		SpeedKMH:      math.Float32frombits(binary.LittleEndian.Uint32(data[28:32])),
+		CurrentMaxRPM: int32(binary.LittleEndian.Uint32(data[588:592])),
 	}, nil
 }
 
@@ -306,11 +319,12 @@ const dashboardHTML = `<!doctype html>
 </main>
 <script>
 const els={rows:document.getElementById('rows'),raw:document.getElementById('raw'),dot:document.getElementById('dot'),status:document.getElementById('status')};
-let state={speedKmh:0,rpm:0,gear:'N',gas:0,brake:0,steer:0},lastSeen=0;
-const fields=[['packetId','Packet ID'],['speedKmh','Speed km/h'],['rpm','RPM'],['gear','Gear'],['gas','Throttle'],['brake','Brake'],['steer','Steer']];
+let state={speedKmh:0,physics:{rpm:0,currentMaxRpm:0},rpmRatio:0,gear:'N',gas:0,brake:0,steer:0},lastSeen=0;
+const fields=[['packetId','Packet ID'],['speedKmh','Speed km/h'],['physics.rpm','Physics RPM'],['physics.currentMaxRpm','Physics current max RPM'],['rpmRatio','RPM ratio'],['gear','Gear'],['gas','Throttle'],['brake','Brake'],['steer','Steer']];
 els.rows.innerHTML=fields.map(([key,label])=>'<tr><th>'+label+'</th><td id="f_'+key+'">-</td></tr>').join('');
+function valueAt(obj,path){return path.split('.').reduce((v,k)=>v?.[k],obj)}
 function render(){
-  for(const [key] of fields){const el=document.getElementById('f_'+key);let value=state[key];if(typeof value==='number')value=Number.isInteger(value)?value:value.toFixed(3);el.textContent=value ?? '-'}
+  for(const [key] of fields){const el=document.getElementById('f_'+key);let value=valueAt(state,key);if(typeof value==='number')value=Number.isInteger(value)?value:value.toFixed(4);el.textContent=value ?? '-'}
   els.raw.textContent=JSON.stringify(state,null,2);
   const live=Date.now()-lastSeen<750; els.dot.classList.toggle('live',live); els.status.textContent=live?'live':'waiting';
   requestAnimationFrame(render);
